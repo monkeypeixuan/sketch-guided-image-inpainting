@@ -17,6 +17,8 @@ import time
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.dpm_solver import DPMSolverSampler
+from transformers import CLIPProcessor, CLIPModel
+import csv
 
 
 
@@ -117,6 +119,59 @@ def load_model_from_config(config, ckpt, gpu, verbose=False):
     model.eval()
     return model
 
+
+def calculate_clip_score(image1, image2, model, processor):
+    """
+    计算两张图像之间的CLIP评分
+    """
+    image1 = processor(images=image1, return_tensors="pt")["pixel_values"]
+    image2 = processor(images=image2, return_tensors="pt")["pixel_values"]
+    # Get image features using CLIP model (without gradients)
+    with torch.no_grad():
+        embedding_a = model.get_image_features(image1)
+        embedding_b = model.get_image_features(image2)
+
+    # Normalize the embeddings to unit vectors
+    embedding_a = embedding_a / embedding_a.norm(p=2, dim=-1, keepdim=True)
+    embedding_b = embedding_b / embedding_b.norm(p=2, dim=-1, keepdim=True)
+
+    # Calculate the cosine similarity between the embeddings
+    similarity_score = torch.nn.functional.cosine_similarity(embedding_a, embedding_b)
+
+    return similarity_score.item()
+
+def calculate_text_clip_score(image, text, model, processor):
+    """
+    计算图像和文本之间的CLIP评分
+    """
+    inputs = processor(text=[text], images=image, return_tensors="pt")
+    outputs = model(**inputs)
+    logits_per_image = outputs.logits_per_image  # 获取图像和文本之间的相似度得分
+    clip_score = logits_per_image[0].item()
+    return clip_score
+
+def evaluate_results(inpainted_image, subject_image, text_prompt):
+    """
+    评估结果，计算主题身份一致性和文本语义一致性
+    """
+    # 加载CLIP模型和处理器
+    model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+    
+    # 计算主题身份一致性（CLIP-I）
+    clip_i_score = calculate_clip_score(inpainted_image, subject_image, model, processor)
+    
+    # 计算文本语义一致性（CLIP-T）
+    clip_t_score = calculate_text_clip_score(inpainted_image, text_prompt, model, processor)
+    
+    return clip_i_score, clip_t_score
+
+csv_file_path="/root/autodl-tmp/users/hpx/TF-ICON/scripts/score.CSV"
+# 写入评估结果到CSV文件
+def write_to_csv(index, clip_i_score, clip_t_score):
+    with open(csv_file_path, mode='a', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow([index, clip_i_score, clip_t_score])
 
 def main():
     parser = argparse.ArgumentParser()
@@ -354,6 +409,7 @@ def main():
                 init_image, target_width, target_height = load_img(opt.init_img, scale)
                 init_image = repeat(init_image.to(device), '1 ... -> b ...', b=batch_size)
                 save_image = init_image.clone()
+                #subject_image,w,h=load_img(opt.ref_img, scale)
                 
 
                 # read foreground image and its segmentation map
@@ -361,7 +417,7 @@ def main():
                 ref_image = repeat(ref_image.to(device), '1 ... -> b ...', b=batch_size)
                 
                 sketch_path = "/root/autodl-tmp/users/hpx/TF-ICON/inputs/same_domain/a professional photograph of a people and a dog, ultra realistic/dogSketch.png"
-                sketch_image, width, height, segmentation_map  = load_img(sketch_path, scale, seg=opt.seg, target_size=(target_width, target_height))
+                sketch_image, w, h  = load_img(sketch_path, scale, seg= False , target_size=(target_width, target_height))
                 sketch_image = repeat(sketch_image.to(device), '1 ... -> b ...', b=batch_size)
 
                 segmentation_map_orig = repeat(torch.tensor(segmentation_map)[None, None, ...].to(device), '1 1 ... -> b 4 ...', b=batch_size)
@@ -401,6 +457,7 @@ def main():
                 # image.save('./outputs/mask_bg_fg.jpg')
                 image = Image.fromarray(((save_image/torch.max(save_image.max(), abs(save_image.min())) + 1) * 127.5)[0].permute(1,2,0).to(dtype=torch.uint8).cpu().numpy())
                 image.save('./outputs/cp_bg_fg.jpg')
+                subject_image = image
 
                 precision_scope = autocast if opt.precision == "autocast" else nullcontext
                 
@@ -534,8 +591,34 @@ def main():
                             
                             for x_sample in x_samples:
                                 x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
+                                
+                                
+                                mask = Image.open(opt.mask)
+                                mask = mask.resize((512, 512), resample=Image.Resampling.BILINEAR)
+                                mask = mask.convert("L")  # 转为灰度图
+                                # 使用mask进行区域提取（将非mask区域置为黑色）
+                                mask_np = np.array(mask)
+                                masked_region = np.zeros_like(x_sample)
+                                masked_region[mask_np > 0] = x_sample[mask_np > 0]
+                                # 将提取的区域转换为PIL图像格式
+                                masked_region = (masked_region * 255).astype(np.uint8)
+                                masked_region_image = Image.fromarray(masked_region)
+                    
+                                # 调整图像大小为目标尺寸（默认为512x512
+                                masked_region_image = masked_region_image.resize((512, 512), resample=Image.Resampling.BILINEAR)
+                                subject_image = Image.open(opt.ref_img)
+                                subject_image = subject_image.resize((512, 512), resample=Image.Resampling.BILINEAR)
+                                
+                                
                                 img = Image.fromarray(x_sample.astype(np.uint8))
                                 img.save(os.path.join(sample_path, f"{base_count:05}_{prompts[0]}.png"))
+                                # 进行评估
+                                
+                                clip_i_score, clip_t_score = evaluate_results(img, subject_image, prompts[0])
+                                print(f"主题身份一致性（CLIP-I）评分: {clip_i_score}")
+                                print(f"文本语义一致性（CLIP-T）评分: {clip_t_score}")
+                                    # 写入评估结果到CSV文件
+                                write_to_csv(base_count, clip_i_score, clip_t_score)
                                 base_count += 1
 
                 del x_samples, samples, z_enc, z_ref_enc, samples_orig, samples_for_cross, samples_ref, mask, x_sample, img, c, uc, inv_emb
