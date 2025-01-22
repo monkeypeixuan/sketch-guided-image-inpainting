@@ -344,7 +344,7 @@ def main():
         raise ValueError("Invalid domain")
         
     batch_size = opt.n_samples
-    sample_path = os.path.join(outpath, file_name)
+    sample_path = "/root/autodl-tmp/users/hpx/Evaluation Dataset/output"
     os.makedirs(sample_path, exist_ok=True)
     base_count = len(os.listdir(sample_path))
 
@@ -353,154 +353,172 @@ def main():
     model = model.to(device)
     sampler = DPMSolverSampler(model)
     
-    for subdir, _, files in os.walk(opt.root):
-        for file in files:
+     # 读取CSV文件
+    csv_file = "/root/autodl-tmp/users/hpx/Evaluation Dataset/data.CSV"  # 假设opt中新增了csv_file属性来指定CSV文件路径
+    with open(csv_file, 'r') as file:
+        reader = csv.DictReader(file)
+        for row in reader:
             torch.cuda.empty_cache()
-            file_path = os.path.join(subdir, file)
-            result = re.search(r'./inputs/[^/]+/(.+)/bg\d+\.', file_path)
-            if result:
-                prompt = result.group(1)
-                
-            if file_path.endswith('.jpg') or file_path.endswith('.jpeg') or file_path.endswith('.png'):
-                if file.startswith('bg'):
-                    opt.init_img = file_path
-                elif file.startswith('fg') and not (file.endswith('mask.jpg') or file.endswith('mask.png')):
-                    opt.ref_img = file_path
-                elif file.startswith('mask'):
-                    opt.mask = file_path
-                elif file.startswith('fg') and (file.endswith('mask.jpg') or file.endswith('mask.png')):
-                    opt.seg = file_path
-                    
-            if file == files[-1]:
-                seed_everything(opt.seed)
-                img = cv2.imread(opt.mask, 0)
-                img = cv2.resize(img, (512, 512))
-                # Threshold the image to create binary image
-                _, binary = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY)
-                # Find the contours of the white region in the image
-                contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                # Find the bounding rectangle of the largest contour
-                x, y, new_w, new_h = cv2.boundingRect(contours[0])
-                # Calculate the center of the rectangle
-                center_x = x + new_w / 2
-                center_y = y + new_h / 2
-                # Calculate the percentage from the top and left
-                center_row_from_top = round(center_y / 512, 2)
-                center_col_from_left = round(center_x / 512, 2)
+            # 获取参数
+            bg_id = row['bg_id']
+            fg_id = row['fg_id']
+            prompt = row['prompt']
 
-                aspect_ratio = new_h / new_w
-                
-                if aspect_ratio > 1:  
-                    scale = new_w * aspect_ratio / 256  
-                    scale = new_h / 256
-                else:  
-                    scale = new_w / 256
-                    scale = new_h / (aspect_ratio * 256) 
-                     
-                scale = round(scale, 2)
-                
-                # =============================================================================================
-        
-                assert prompt is not None
-                data = [batch_size * [prompt]]
-                
-                # read background image              
-                assert os.path.isfile(opt.init_img)
-                init_image, target_width, target_height = load_img(opt.init_img, scale)
-                init_image = repeat(init_image.to(device), '1 ... -> b ...', b=batch_size)
-                save_image = init_image.clone()
-                #subject_image,w,h=load_img(opt.ref_img, scale)
-                
-
-                # read foreground image and its segmentation map
-                ref_image, width, height, segmentation_map  = load_img(opt.ref_img, scale, seg=opt.seg, target_size=(target_width, target_height))
-                ref_image = repeat(ref_image.to(device), '1 ... -> b ...', b=batch_size)
-                
-                sketch_path = "/root/autodl-tmp/users/hpx/TF-ICON/inputs/same_domain/a professional photograph of a people and a dog, ultra realistic/dogSketch.png"
-                sketch_image, w, h  = load_img(sketch_path, scale, seg= False , target_size=(target_width, target_height))
-                sketch_image = repeat(sketch_image.to(device), '1 ... -> b ...', b=batch_size)
-
-                segmentation_map_orig = repeat(torch.tensor(segmentation_map)[None, None, ...].to(device), '1 1 ... -> b 4 ...', b=batch_size)
-                segmentation_map_save = repeat(torch.tensor(segmentation_map)[None, None, ...].to(device), '1 1 ... -> b 3 ...', b=batch_size)
-                segmentation_map = segmentation_map_orig[:, :, ::8, ::8].to(device)
-
-                top_rr = int((0.5*(target_height - height))/target_height * init_image.shape[2])  # xx% from the top
-                bottom_rr = int((0.5*(target_height + height))/target_height * init_image.shape[2])  
-                left_rr = int((0.5*(target_width - width))/target_width * init_image.shape[3])  # xx% from the left
-                right_rr = int((0.5*(target_width + width))/target_width * init_image.shape[3]) 
-
-                center_row_rm = int(center_row_from_top * target_height)
-                center_col_rm = int(center_col_from_left * target_width)
-
-                step_height2, remainder = divmod(height, 2)
-                step_height1 = step_height2 + remainder
-                step_width2, remainder = divmod(width, 2)
-                step_width1 = step_width2 + remainder
-                
-                # compositing in pixel space for same-domain composition
-                save_image[:, :, center_row_rm - step_height1:center_row_rm + step_height2, center_col_rm - step_width1:center_col_rm + step_width2] \
-                        = save_image[:, :, center_row_rm - step_height1:center_row_rm + step_height2, center_col_rm - step_width1:center_col_rm + step_width2].clone() \
-                        * (1 - segmentation_map_save[:, :, top_rr:bottom_rr, left_rr:right_rr]) \
-                        + ref_image[:, :, top_rr:bottom_rr, left_rr:right_rr].clone() \
-                        * segmentation_map_save[:, :, top_rr:bottom_rr, left_rr:right_rr]
-                
-
-                #image_path = '/root/autodl-tmp/users/hpx/TF-ICON/inputs/same_domain/a professional photograph of a dog, ultra realistic/cp_4535_507322.jpg'
-                #save_image,w,h = load_img(image_path,scale)
-                #save_image = repeat(save_image.to(device), '1 ... -> b ...', b=batch_size)
-
-                # save the mask and the pixel space composited image
-                save_mask = torch.zeros_like(init_image) 
-                save_mask[:, :, center_row_rm - step_height1:center_row_rm + step_height2, center_col_rm - step_width1:center_col_rm + step_width2] = 1
-
-                # image = Image.fromarray(((save_mask) * 255)[0].permute(1,2,0).to(dtype=torch.uint8).cpu().numpy())
-                # image.save('./outputs/mask_bg_fg.jpg')
-                image = Image.fromarray(((save_image/torch.max(save_image.max(), abs(save_image.min())) + 1) * 127.5)[0].permute(1,2,0).to(dtype=torch.uint8).cpu().numpy())
-                image.save('./outputs/cp_bg_fg.jpg')
-                subject_image = image
-
-                precision_scope = autocast if opt.precision == "autocast" else nullcontext
-                
-                # image composition
-                with torch.no_grad():
-                    with precision_scope("cuda"):
-                        for prompts in data:
-                            print(prompts)
-                            c, uc, inv_emb = load_model_and_get_prompt_embedding(model, opt, device, prompts, inv=True)
-                            
-                            if opt.domain == 'same': # same domain
-                                init_image = save_image  #这里的init_image改为corrupted_image，注意看前面有没有totensor
-                            
-                            T1 = time.time()
-                            init_latent = model.get_first_stage_encoding(model.encode_first_stage(init_image))  
-                            
+            # 假设根据bg_id和fg_id构造文件路径
+            opt.init_img = f"/root/autodl-tmp/users/hpx/Evaluation Dataset/background/{bg_id}.jpg"
+            opt.ref_img = f"/root/autodl-tmp/users/hpx/Evaluation Dataset/foreground/{fg_id}.jpg"
+            opt.mask = f"/root/autodl-tmp/users/hpx/Evaluation Dataset/background/mask_{bg_id}.jpg"  # 这里的路径构造需要根据实际情况调整
+            opt.seg = f"/root/autodl-tmp/users/hpx/Evaluation Dataset/foreground/mask_{fg_id}.jpg"  # 这里的路径构造需要根据实际情况调整
+            sketch_path = f"/root/autodl-tmp/users/hpx/Evaluation Dataset/sketch/{prompt}.png" 
             
-                            # ref's location in ref image in the latent space
-                            top_rr = int((0.5*(target_height - height))/target_height * init_latent.shape[2])  
-                            bottom_rr = int((0.5*(target_height + height))/target_height * init_latent.shape[2])  
-                            left_rr = int((0.5*(target_width - width))/target_width * init_latent.shape[3])  
-                            right_rr = int((0.5*(target_width + width))/target_width * init_latent.shape[3]) 
-                                                  
-                            new_height = bottom_rr - top_rr
-                            new_width = right_rr - left_rr
-                            
-                            step_height2, remainder = divmod(new_height, 2)
-                            step_height1 = step_height2 + remainder
-                            step_width2, remainder = divmod(new_width, 2)
-                            step_width1 = step_width2 + remainder
-                            
-                            center_row_rm = int(center_row_from_top * init_latent.shape[2])
-                            center_col_rm = int(center_col_from_left * init_latent.shape[3])
-                            
-                            param = [max(0, int(center_row_rm - step_height1)), 
-                                    min(init_latent.shape[2] - 1, int(center_row_rm + step_height2)),
-                                    max(0, int(center_col_rm - step_width1)), 
-                                    min(init_latent.shape[3] - 1, int(center_col_rm + step_width2))]
-                            
-                            sketch_latent = model.get_first_stage_encoding(model.encode_first_stage(sketch_image))
+            seed_everything(opt.seed)
+            img = cv2.imread(opt.mask, 0)
+            img = cv2.resize(img, (512, 512))
+            # Threshold the image to create binary image
+            _, binary = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY)
+            # Find the contours of the white region in the image
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # Find the bounding rectangle of the largest contour
+            x, y, new_w, new_h = cv2.boundingRect(contours[0])
+            # Calculate the center of the rectangle
+            center_x = x + new_w / 2
+            center_y = y + new_h / 2
+            # Calculate the percentage from the top and left
+            center_row_from_top = round(center_y / 512, 2)
+            center_col_from_left = round(center_x / 512, 2)
+
+            aspect_ratio = new_h / new_w
+                
+            if aspect_ratio > 1:  
+                scale = new_w * aspect_ratio / 256  
+                scale = new_h / 256
+            else:  
+                scale = new_w / 256
+                scale = new_h / (aspect_ratio * 256) 
+                     
+            scale = round(scale, 2)
+            
+            prompt = f"A professional, ultra-realistic photograph of {prompt}."
+                
+            # =============================================================================================
+        
+            assert prompt is not None
+            data = [batch_size * [prompt]]
+            
+            # read background image              
+            assert os.path.isfile(opt.init_img)
+            init_image, target_width, target_height = load_img(opt.init_img, scale)
+            init_image = repeat(init_image.to(device), '1 ... -> b ...', b=batch_size)
+            save_image = init_image.clone()
+            #subject_image,w,h=load_img(opt.ref_img, scale)
+            
+
+            # read foreground image and its segmentation map
+            ref_image, width, height, segmentation_map  = load_img(opt.ref_img, scale, seg=opt.seg, target_size=(target_width, target_height))
+            ref_image = repeat(ref_image.to(device), '1 ... -> b ...', b=batch_size)
+            
+            #sketch_path = "/root/autodl-tmp/users/hpx/TF-ICON/inputs/same_domain/a professional photograph of a people and a dog, ultra realistic/dogSketch.png"
+            sketch_image, w, h  = load_img(sketch_path, scale, seg= False , target_size=(target_width, target_height))
+            sketch_image = repeat(sketch_image.to(device), '1 ... -> b ...', b=batch_size)
+
+            segmentation_map_orig = repeat(torch.tensor(segmentation_map)[None, None, ...].to(device), '1 1 ... -> b 4 ...', b=batch_size)
+            segmentation_map_save = repeat(torch.tensor(segmentation_map)[None, None, ...].to(device), '1 1 ... -> b 3 ...', b=batch_size)
+            segmentation_map = segmentation_map_orig[:, :, ::8, ::8].to(device)
+
+            top_rr = int((0.5*(target_height - height))/target_height * init_image.shape[2])  # xx% from the top
+            bottom_rr = int((0.5*(target_height + height))/target_height * init_image.shape[2])  
+            left_rr = int((0.5*(target_width - width))/target_width * init_image.shape[3])  # xx% from the left
+            right_rr = int((0.5*(target_width + width))/target_width * init_image.shape[3]) 
+
+            center_row_rm = int(center_row_from_top * target_height)
+            center_col_rm = int(center_col_from_left * target_width)
+
+            step_height2, remainder = divmod(height, 2)
+            step_height1 = step_height2 + remainder
+            step_width2, remainder = divmod(width, 2)
+            step_width1 = step_width2 + remainder
+            
+            # compositing in pixel space for same-domain composition
+            save_image[:, :, center_row_rm - step_height1:center_row_rm + step_height2, center_col_rm - step_width1:center_col_rm + step_width2] \
+                    = save_image[:, :, center_row_rm - step_height1:center_row_rm + step_height2, center_col_rm - step_width1:center_col_rm + step_width2].clone() \
+                    * (1 - segmentation_map_save[:, :, top_rr:bottom_rr, left_rr:right_rr]) \
+                    + ref_image[:, :, top_rr:bottom_rr, left_rr:right_rr].clone() \
+                    * segmentation_map_save[:, :, top_rr:bottom_rr, left_rr:right_rr]
+            
+
+            #image_path = '/root/autodl-tmp/users/hpx/TF-ICON/inputs/same_domain/a professional photograph of a dog, ultra realistic/cp_4535_507322.jpg'
+            #save_image,w,h = load_img(image_path,scale)
+            #save_image = repeat(save_image.to(device), '1 ... -> b ...', b=batch_size)
+
+            # save the mask and the pixel space composited image
+            save_mask = torch.zeros_like(init_image) 
+            save_mask[:, :, center_row_rm - step_height1:center_row_rm + step_height2, center_col_rm - step_width1:center_col_rm + step_width2] = 1
+
+            # image = Image.fromarray(((save_mask) * 255)[0].permute(1,2,0).to(dtype=torch.uint8).cpu().numpy())
+            # image.save('./outputs/mask_bg_fg.jpg')
+            image = Image.fromarray(((save_image/torch.max(save_image.max(), abs(save_image.min())) + 1) * 127.5)[0].permute(1,2,0).to(dtype=torch.uint8).cpu().numpy())
+            image.save('./outputs/cp_bg_fg.jpg')
+            subject_image = image
+
+            precision_scope = autocast if opt.precision == "autocast" else nullcontext
+            
+            # image composition
+            with torch.no_grad():
+                with precision_scope("cuda"):
+                    for prompts in data:
+                        print(prompts)
+                        c, uc, inv_emb = load_model_and_get_prompt_embedding(model, opt, device, prompts, inv=True)
                         
-                            shape = [init_latent.shape[1], init_latent.shape[2], init_latent.shape[3]]
-                            z_enc, _ = sampler.sample(steps=opt.dpm_steps,
+                        if opt.domain == 'same': # same domain
+
+                            init_image = save_image  #这里的init_image改为corrupted_image，注意看前面有没有totensor
+                        
+                        T1 = time.time()
+                        init_latent = model.get_first_stage_encoding(model.encode_first_stage(init_image))  
+                        
+        
+                        # ref's location in ref image in the latent space
+                        top_rr = int((0.5*(target_height - height))/target_height * init_latent.shape[2])  
+                        bottom_rr = int((0.5*(target_height + height))/target_height * init_latent.shape[2])  
+                        left_rr = int((0.5*(target_width - width))/target_width * init_latent.shape[3])  
+                        right_rr = int((0.5*(target_width + width))/target_width * init_latent.shape[3]) 
+                                                
+                        new_height = bottom_rr - top_rr
+                        new_width = right_rr - left_rr
+                        
+                        step_height2, remainder = divmod(new_height, 2)
+                        step_height1 = step_height2 + remainder
+                        step_width2, remainder = divmod(new_width, 2)
+                        step_width1 = step_width2 + remainder
+                        
+                        center_row_rm = int(center_row_from_top * init_latent.shape[2])
+                        center_col_rm = int(center_col_from_left * init_latent.shape[3])
+                        
+                        param = [max(0, int(center_row_rm - step_height1)), 
+                                min(init_latent.shape[2] - 1, int(center_row_rm + step_height2)),
+                                max(0, int(center_col_rm - step_width1)), 
+                                min(init_latent.shape[3] - 1, int(center_col_rm + step_width2))]
+                        
+                        sketch_latent = model.get_first_stage_encoding(model.encode_first_stage(sketch_image))
+                    
+                        shape = [init_latent.shape[1], init_latent.shape[2], init_latent.shape[3]]
+                        z_enc, _ = sampler.sample(steps=opt.dpm_steps,
+                                                inv_emb=inv_emb,
+                                                unconditional_conditioning=uc,
+                                                conditioning=c,
+                                                batch_size=opt.n_samples,
+                                                shape=shape,
+                                                verbose=False,
+                                                unconditional_guidance_scale=opt.scale,
+                                                eta=opt.ddim_eta,
+                                                order=opt.dpm_order,
+                                                x_T=init_latent,
+                                                width=width,
+                                                height=height,
+                                                DPMencode=True,
+                                                )
+                        
+                        z_ref_enc, _ = sampler.sample(steps=opt.dpm_steps,
                                                     inv_emb=inv_emb,
                                                     unconditional_conditioning=uc,
                                                     conditioning=c,
@@ -510,123 +528,108 @@ def main():
                                                     unconditional_guidance_scale=opt.scale,
                                                     eta=opt.ddim_eta,
                                                     order=opt.dpm_order,
-                                                    x_T=init_latent,
+                                                    x_T=sketch_latent,
+                                                    DPMencode=True,
                                                     width=width,
                                                     height=height,
-                                                    DPMencode=True,
+                                                    ref=True,
+                                                    )
+                        
+                        samples_orig = z_enc.clone()
+
+                        print(f"param: {param}")
+                        print(f"top_rr: {top_rr}, bottom_rr: {bottom_rr}, left_rr: {left_rr}, right_rr: {right_rr}")
+                        # inpainting in XOR region of M_seg and M_mask
+                        z_enc[:, :, param[0]:param[1], param[2]:param[3]] \
+                            = z_enc[:, :, param[0]:param[1], param[2]:param[3]] \
+                            * segmentation_map[:, :, top_rr:bottom_rr, left_rr:right_rr] \
+                            + torch.randn((1, 4, bottom_rr - top_rr, right_rr - left_rr), device=device) \
+                            * (1 - segmentation_map[:, :, top_rr:bottom_rr, left_rr:right_rr])
+
+                        samples_for_cross = samples_orig.clone()
+                        samples_ref = z_ref_enc.clone()
+                        samples = z_enc.clone()
+
+                        # noise composition
+                        if opt.domain == 'cross': 
+                            samples[:, :, param[0]:param[1], param[2]:param[3]] = torch.randn((1, 4, bottom_rr - top_rr, right_rr - left_rr), device=device) 
+                            # apply the segmentation mask on the noise
+                            samples[:, :, param[0]:param[1], param[2]:param[3]] \
+                                    = samples[:, :, param[0]:param[1], param[2]:param[3]].clone() \
+                                    * (1 - segmentation_map[:, :, top_rr: bottom_rr, left_rr: right_rr]) \
+                                    + z_ref_enc[:, :, top_rr: bottom_rr, left_rr: right_rr].clone() \
+                                    * segmentation_map[:, :, top_rr: bottom_rr, left_rr: right_rr]
+                        
+                        mask = torch.zeros_like(z_enc, device=device)
+                        mask[:, :, param[0]:param[1], param[2]:param[3]] = 1
+                                            
+                        samples, _ = sampler.sample(steps=opt.dpm_steps,
+                                                    inv_emb=inv_emb,
+                                                    conditioning=c,
+                                                    batch_size=opt.n_samples,
+                                                    shape=shape,
+                                                    verbose=False,
+                                                    unconditional_guidance_scale=opt.scale,
+                                                    unconditional_conditioning=uc,
+                                                    eta=opt.ddim_eta,
+                                                    order=opt.dpm_order,
+                                                    x_T=[samples_orig, samples.clone(), samples_for_cross, samples_ref, samples, init_latent],
+                                                    width=width,
+                                                    height=height,
+                                                    segmentation_map=segmentation_map,
+                                                    param=param,
+                                                    mask=mask,
+                                                    target_height=target_height, 
+                                                    target_width=target_width,
+                                                    center_row_rm=center_row_from_top,
+                                                    center_col_rm=center_col_from_left,
+                                                    tau_a=opt.tau_a,
+                                                    tau_b=opt.tau_b,
                                                     )
                             
-                            z_ref_enc, _ = sampler.sample(steps=opt.dpm_steps,
-                                                        inv_emb=inv_emb,
-                                                        unconditional_conditioning=uc,
-                                                        conditioning=c,
-                                                        batch_size=opt.n_samples,
-                                                        shape=shape,
-                                                        verbose=False,
-                                                        unconditional_guidance_scale=opt.scale,
-                                                        eta=opt.ddim_eta,
-                                                        order=opt.dpm_order,
-                                                        x_T=sketch_latent,
-                                                        DPMencode=True,
-                                                        width=width,
-                                                        height=height,
-                                                        ref=True,
-                                                        )
+                        x_samples = model.decode_first_stage(samples)
+                        x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
+                        
+                        T2 = time.time()
+                        print('Running Time: %s s' % ((T2 - T1)))
+                        
+                        for x_sample in x_samples:
+                            x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
                             
-                            samples_orig = z_enc.clone()
-
-                            # inpainting in XOR region of M_seg and M_mask
-                            z_enc[:, :, param[0]:param[1], param[2]:param[3]] \
-                                = z_enc[:, :, param[0]:param[1], param[2]:param[3]] \
-                                * segmentation_map[:, :, top_rr:bottom_rr, left_rr:right_rr] \
-                                + torch.randn((1, 4, bottom_rr - top_rr, right_rr - left_rr), device=device) \
-                                * (1 - segmentation_map[:, :, top_rr:bottom_rr, left_rr:right_rr])
-
-                            samples_for_cross = samples_orig.clone()
-                            samples_ref = z_ref_enc.clone()
-                            samples = z_enc.clone()
-
-                            # noise composition
-                            if opt.domain == 'cross': 
-                                samples[:, :, param[0]:param[1], param[2]:param[3]] = torch.randn((1, 4, bottom_rr - top_rr, right_rr - left_rr), device=device) 
-                                # apply the segmentation mask on the noise
-                                samples[:, :, param[0]:param[1], param[2]:param[3]] \
-                                        = samples[:, :, param[0]:param[1], param[2]:param[3]].clone() \
-                                        * (1 - segmentation_map[:, :, top_rr: bottom_rr, left_rr: right_rr]) \
-                                        + z_ref_enc[:, :, top_rr: bottom_rr, left_rr: right_rr].clone() \
-                                        * segmentation_map[:, :, top_rr: bottom_rr, left_rr: right_rr]
+                            """
+                            mask = Image.open(opt.mask)
+                            mask = mask.resize((512, 512), resample=Image.Resampling.BILINEAR)
+                            mask = mask.convert("L")  # 转为灰度图
+                            # 使用mask进行区域提取（将非mask区域置为黑色）
+                            mask_np = np.array(mask)
+                            masked_region = np.zeros_like(x_sample)
+                            masked_region[mask_np > 0] = x_sample[mask_np > 0]
+                            # 将提取的区域转换为PIL图像格式
+                            masked_region = (masked_region * 255).astype(np.uint8)
+                            masked_region_image = Image.fromarray(masked_region)
+                
+                            # 调整图像大小为目标尺寸（默认为512x512
+                            masked_region_image = masked_region_image.resize((512, 512), resample=Image.Resampling.BILINEAR)
+                            subject_image = Image.open(opt.ref_img)
+                            subject_image = subject_image.resize((512, 512), resample=Image.Resampling.BILINEAR)
+                            """
                             
-                            mask = torch.zeros_like(z_enc, device=device)
-                            mask[:, :, param[0]:param[1], param[2]:param[3]] = 1
-                                                
-                            samples, _ = sampler.sample(steps=opt.dpm_steps,
-                                                        inv_emb=inv_emb,
-                                                        conditioning=c,
-                                                        batch_size=opt.n_samples,
-                                                        shape=shape,
-                                                        verbose=False,
-                                                        unconditional_guidance_scale=opt.scale,
-                                                        unconditional_conditioning=uc,
-                                                        eta=opt.ddim_eta,
-                                                        order=opt.dpm_order,
-                                                        x_T=[samples_orig, samples.clone(), samples_for_cross, samples_ref, samples, init_latent],
-                                                        width=width,
-                                                        height=height,
-                                                        segmentation_map=segmentation_map,
-                                                        param=param,
-                                                        mask=mask,
-                                                        target_height=target_height, 
-                                                        target_width=target_width,
-                                                        center_row_rm=center_row_from_top,
-                                                        center_col_rm=center_col_from_left,
-                                                        tau_a=opt.tau_a,
-                                                        tau_b=opt.tau_b,
-                                                        )
-                                
-                            x_samples = model.decode_first_stage(samples)
-                            x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
+                            img = Image.fromarray(x_sample.astype(np.uint8))
+                            img.save(os.path.join(sample_path, f"{base_count:05}_{prompts[0]}.png"))
+                            # 进行评估
                             
-                            T2 = time.time()
-                            print('Running Time: %s s' % ((T2 - T1)))
-                            
-                            for x_sample in x_samples:
-                                x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
-                                
-                                
-                                mask = Image.open(opt.mask)
-                                mask = mask.resize((512, 512), resample=Image.Resampling.BILINEAR)
-                                mask = mask.convert("L")  # 转为灰度图
-                                # 使用mask进行区域提取（将非mask区域置为黑色）
-                                mask_np = np.array(mask)
-                                masked_region = np.zeros_like(x_sample)
-                                masked_region[mask_np > 0] = x_sample[mask_np > 0]
-                                # 将提取的区域转换为PIL图像格式
-                                masked_region = (masked_region * 255).astype(np.uint8)
-                                masked_region_image = Image.fromarray(masked_region)
-                    
-                                # 调整图像大小为目标尺寸（默认为512x512
-                                masked_region_image = masked_region_image.resize((512, 512), resample=Image.Resampling.BILINEAR)
-                                subject_image = Image.open(opt.ref_img)
-                                subject_image = subject_image.resize((512, 512), resample=Image.Resampling.BILINEAR)
-                                
-                                
-                                img = Image.fromarray(x_sample.astype(np.uint8))
-                                img.save(os.path.join(sample_path, f"{base_count:05}_{prompts[0]}.png"))
-                                # 进行评估
-                                
-                                clip_i_score, clip_t_score = evaluate_results(img, subject_image, prompts[0])
-                                print(f"主题身份一致性（CLIP-I）评分: {clip_i_score}")
-                                print(f"文本语义一致性（CLIP-T）评分: {clip_t_score}")
-                                    # 写入评估结果到CSV文件
-                                write_to_csv(base_count, clip_i_score, clip_t_score)
-                                base_count += 1
+                            clip_i_score, clip_t_score = evaluate_results(img, subject_image, prompts[0])
+                            print(f"主题身份一致性（CLIP-I）评分: {clip_i_score}")
+                            print(f"文本语义一致性（CLIP-T）评分: {clip_t_score}")
+                                # 写入评估结果到CSV文件
+                            write_to_csv(base_count, clip_i_score, clip_t_score)
+                            base_count += 1
 
-                del x_samples, samples, z_enc, z_ref_enc, samples_orig, samples_for_cross, samples_ref, mask, x_sample, img, c, uc, inv_emb
-                del param, segmentation_map, top_rr, bottom_rr, left_rr, right_rr, target_height, target_width, center_row_rm, center_col_rm
-                del init_image, init_latent, save_image, ref_image, sketch_latent, prompt, prompts, data, binary, contours
-
-    print(f"Your samples are ready and waiting for you here: \n{sample_path} \nEnjoy.")
-
+            del x_samples, samples, z_enc, z_ref_enc, samples_orig, samples_for_cross, samples_ref, mask, x_sample, img, c, uc, inv_emb
+            del param, segmentation_map, top_rr, bottom_rr, left_rr, right_rr, target_height, target_width, center_row_rm, center_col_rm
+            del init_image, init_latent, save_image, ref_image, sketch_latent, prompt, prompts, data, binary, contours
+        
+        print(f"Your samples are ready and waiting for you here: \n{sample_path} \nEnjoy.")
 
 if __name__ == "__main__":
     main()
