@@ -19,6 +19,9 @@ from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.dpm_solver import DPMSolverSampler
 from transformers import CLIPProcessor, CLIPModel
 import csv
+from transformers import AutoImageProcessor, AutoModel
+from PIL import Image
+import torch.nn as nn
 
 
 
@@ -150,6 +153,43 @@ def calculate_text_clip_score(image, text, model, processor):
     clip_score = logits_per_image[0].item()
     return clip_score
 
+def calculate_dino_similarity(image1, image2):
+    """
+    使用DINO模型计算两张图像的相似度
+    """
+    # 检查是否有可用的GPU，如果有则使用GPU，否则使用CPU
+    device = torch.device('cuda' if torch.cuda.is_available() else "cpu")
+    # 加载DINO的图像处理器和模型
+    processor = AutoImageProcessor.from_pretrained('facebook/dino-vits16')
+    model = AutoModel.from_pretrained('facebook/dino-vits16').to(device)
+
+    with torch.no_grad():
+        # 对第一张图像进行预处理并将其移动到指定设备上
+        inputs1 = processor(images=image1, return_tensors="pt").to(device)
+        # 通过模型获取输出
+        outputs1 = model(**inputs1)
+        # 提取最后一层的隐藏状态
+        image_features1 = outputs1.last_hidden_state
+
+        image_features1 = image_features1.mean(dim=1)
+   
+    with torch.no_grad():
+        # 对第二张图像进行预处理并将其移动到指定设备上
+        inputs2 = processor(images=image2, return_tensors="pt").to(device)
+        # 通过模型获取输出
+        outputs2 = model(**inputs2)
+        # 提取最后一层的隐藏状态
+        image_features2 = outputs2.last_hidden_state
+        
+        image_features2 = image_features2.mean(dim=1)
+    
+    cos = nn.CosineSimilarity(dim=0)
+    
+    sim = cos(image_features1[0], image_features2[0]).item()
+    # 将相似度值从[-1, 1]范围映射到[0, 1]范围
+    sim = (sim + 1) / 2
+    return sim
+
 def evaluate_results(inpainted_image, subject_image, text_prompt):
     """
     评估结果，计算主题身份一致性和文本语义一致性
@@ -164,14 +204,17 @@ def evaluate_results(inpainted_image, subject_image, text_prompt):
     # 计算文本语义一致性（CLIP-T）
     clip_t_score = calculate_text_clip_score(inpainted_image, text_prompt, model, processor)
     
-    return clip_i_score, clip_t_score
+    # 计算DINO图像相似度
+    dino_similarity = calculate_dino_similarity(inpainted_image, subject_image)
+    
+    return clip_i_score, clip_t_score, dino_similarity
 
 csv_file_path="/root/autodl-tmp/users/hpx/TF-ICON/scripts/score_tmp.CSV"
 # 写入评估结果到CSV文件
-def write_to_csv(index, clip_i_score, clip_t_score):
+def write_to_csv(index, clip_i_score, clip_t_score,dino_similarity):
     with open(csv_file_path, mode='a', newline='') as file:
         writer = csv.writer(file)
-        writer.writerow([index, clip_i_score, clip_t_score])
+        writer.writerow([index, clip_i_score, clip_t_score,dino_similarity])
 
 
 def get_segmentation_map(seg):
@@ -424,7 +467,10 @@ def main():
             
             mask_map = Image.open(opt.mask).convert("1")
             mask_map_resize = cv2.resize(np.array(mask_map).astype(np.uint8), (512, 512), interpolation=cv2.INTER_NEAREST)
-
+            # 找到 mask 中非零像素的坐标
+            nonzero_indices = np.nonzero(mask_map_resize)
+            min_y, max_y = np.min(nonzero_indices[0]), np.max(nonzero_indices[0])
+            min_x, max_x = np.min(nonzero_indices[1]), np.max(nonzero_indices[1])
             
             #sketch_path = "/root/autodl-tmp/users/hpx/TF-ICON/inputs/same_domain/a professional photograph of a people and a dog, ultra realistic/dogSketch.png"
             sketch_image, w, h,s  = load_img(sketch_path, scale, seg= opt.seg , target_size=(target_width, target_height))
@@ -470,7 +516,7 @@ def main():
             # image.save('./outputs/mask_bg_fg.jpg')
             image = Image.fromarray(((save_image/torch.max(save_image.max(), abs(save_image.min())) + 1) * 127.5)[0].permute(1,2,0).to(dtype=torch.uint8).cpu().numpy())
             image.save('./outputs/cp_bg_fg.jpg')
-            subject_image = image
+            #subject_image = image
 
             precision_scope = autocast if opt.precision == "autocast" else nullcontext
             
@@ -607,9 +653,9 @@ def main():
                         
                         for x_sample in x_samples:
                             x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
-                            
+                            local_image_np = x_sample[min_y:max_y+1, min_x:max_x+1, :]
                             """
-                            mask = Image.open(opt.mask)
+                            subject_image = Image.open(opt.ref_img)
                             mask = mask.resize((512, 512), resample=Image.Resampling.BILINEAR)
                             mask = mask.convert("L")  # 转为灰度图
                             # 使用mask进行区域提取（将非mask区域置为黑色）
@@ -628,13 +674,20 @@ def main():
                             
                             img = Image.fromarray(x_sample.astype(np.uint8))
                             img.save(os.path.join(sample_path, f"{base_count:05}_{prompts[0]}.png"))
-                            # 进行评估
                             
-                            clip_i_score, clip_t_score = evaluate_results(img, subject_image, prompts[0])
+                            # 进行评估
+                            #先截取生成的部分local_image
+                            local_image=Image.fromarray(local_image_np.astype(np.uint8))
+                            local_image = local_image.resize((512, 512), resample=Image.Resampling.BILINEAR)
+                            subject_image = Image.open(opt.ref_img)
+                            subject_image = subject_image.resize((512, 512), resample=Image.Resampling.BILINEAR)
+                            
+                            clip_i_score, clip_t_score, dino_similarity = evaluate_results(local_image, subject_image, prompts[0])
                             print(f"主题身份一致性（CLIP-I）评分: {clip_i_score}")
                             print(f"文本语义一致性（CLIP-T）评分: {clip_t_score}")
-                                # 写入评估结果到CSV文件
-                            write_to_csv(base_count, clip_i_score, clip_t_score)
+                            print(f"DINO评分: {dino_similarity}")
+                            # 写入评估结果到CSV文件
+                            write_to_csv(base_count, clip_i_score, clip_t_score,dino_similarity)
                             base_count += 1
 
             del x_samples, samples, z_enc, z_ref_enc, samples_orig, samples_for_cross, samples_ref, mask, x_sample, img, c, uc, inv_emb
