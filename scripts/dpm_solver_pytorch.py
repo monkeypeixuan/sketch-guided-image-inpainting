@@ -1286,6 +1286,8 @@ class DPM_Solver:
         data['t_prev_list'][-1] = vec_t
         # We do not need to evaluate the final model value.
         if step < steps:
+            #print(f"1289行：data 的形状: {data}")
+            #print(f"1290行：data[] 的形状: {data['x'].shape}")
             data['model_prev_list'][-1] = self.model_fn(data['x'], vec_t, DPMencode=DPMencode, controller=controller, inject=inject, ref_init=ref_init)
         
         del vec_t

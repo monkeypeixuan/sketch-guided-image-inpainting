@@ -166,12 +166,17 @@ def evaluate_results(inpainted_image, subject_image, text_prompt):
     
     return clip_i_score, clip_t_score
 
-csv_file_path="/root/autodl-tmp/users/hpx/TF-ICON/scripts/score.CSV"
+csv_file_path="/root/autodl-tmp/users/hpx/TF-ICON/scripts/score_tmp.CSV"
 # 写入评估结果到CSV文件
 def write_to_csv(index, clip_i_score, clip_t_score):
     with open(csv_file_path, mode='a', newline='') as file:
         writer = csv.writer(file)
         writer.writerow([index, clip_i_score, clip_t_score])
+
+
+def get_segmentation_map(seg):
+    _, _, _, segmentation_map = load_img(None, 1, seg=seg, target_size=(512, 512))  # 这里假设 target_size 为 (100, 100)，可以根据需要修改
+    return segmentation_map
 
 def main():
     parser = argparse.ArgumentParser()
@@ -344,7 +349,7 @@ def main():
         raise ValueError("Invalid domain")
         
     batch_size = opt.n_samples
-    sample_path = "/root/autodl-tmp/users/hpx/Evaluation Dataset/output"
+    sample_path = "/root/autodl-tmp/users/hpx/Evaluation Dataset/output_tmp2"
     os.makedirs(sample_path, exist_ok=True)
     base_count = len(os.listdir(sample_path))
 
@@ -417,13 +422,20 @@ def main():
             ref_image, width, height, segmentation_map  = load_img(opt.ref_img, scale, seg=opt.seg, target_size=(target_width, target_height))
             ref_image = repeat(ref_image.to(device), '1 ... -> b ...', b=batch_size)
             
+            mask_map = Image.open(opt.mask).convert("1")
+            mask_map_resize = cv2.resize(np.array(mask_map).astype(np.uint8), (512, 512), interpolation=cv2.INTER_NEAREST)
+
+            
             #sketch_path = "/root/autodl-tmp/users/hpx/TF-ICON/inputs/same_domain/a professional photograph of a people and a dog, ultra realistic/dogSketch.png"
-            sketch_image, w, h  = load_img(sketch_path, scale, seg= False , target_size=(target_width, target_height))
+            sketch_image, w, h,s  = load_img(sketch_path, scale, seg= opt.seg , target_size=(target_width, target_height))
             sketch_image = repeat(sketch_image.to(device), '1 ... -> b ...', b=batch_size)
 
             segmentation_map_orig = repeat(torch.tensor(segmentation_map)[None, None, ...].to(device), '1 1 ... -> b 4 ...', b=batch_size)
             segmentation_map_save = repeat(torch.tensor(segmentation_map)[None, None, ...].to(device), '1 1 ... -> b 3 ...', b=batch_size)
             segmentation_map = segmentation_map_orig[:, :, ::8, ::8].to(device)
+            
+            mask_map_orig = repeat(torch.tensor(mask_map_resize)[None, None, ...].to(device), '1 1 ... -> b 4 ...', b=batch_size)
+            mask_map = mask_map_orig[:, :, ::8, ::8].to(device)         
 
             top_rr = int((0.5*(target_height - height))/target_height * init_image.shape[2])  # xx% from the top
             bottom_rr = int((0.5*(target_height + height))/target_height * init_image.shape[2])  
@@ -471,7 +483,7 @@ def main():
                         
                         if opt.domain == 'same': # same domain
 
-                            init_image = save_image  #这里的init_image改为corrupted_image，注意看前面有没有totensor
+                            init_image = save_image 
                         
                         T1 = time.time()
                         init_latent = model.get_first_stage_encoding(model.encode_first_stage(init_image))  
@@ -537,15 +549,14 @@ def main():
                         
                         samples_orig = z_enc.clone()
 
-                        print(f"param: {param}")
-                        print(f"top_rr: {top_rr}, bottom_rr: {bottom_rr}, left_rr: {left_rr}, right_rr: {right_rr}")
                         # inpainting in XOR region of M_seg and M_mask
                         z_enc[:, :, param[0]:param[1], param[2]:param[3]] \
                             = z_enc[:, :, param[0]:param[1], param[2]:param[3]] \
-                            * segmentation_map[:, :, top_rr:bottom_rr, left_rr:right_rr] \
+                            * segmentation_map[:, :,  top_rr:bottom_rr, left_rr:right_rr] \
                             + torch.randn((1, 4, bottom_rr - top_rr, right_rr - left_rr), device=device) \
-                            * (1 - segmentation_map[:, :, top_rr:bottom_rr, left_rr:right_rr])
+                            * (1 - segmentation_map[:, :,  top_rr:bottom_rr, left_rr:right_rr])
 
+    
                         samples_for_cross = samples_orig.clone()
                         samples_ref = z_ref_enc.clone()
                         samples = z_enc.clone()
@@ -585,6 +596,7 @@ def main():
                                                     center_col_rm=center_col_from_left,
                                                     tau_a=opt.tau_a,
                                                     tau_b=opt.tau_b,
+                                                    sketch=sketch_image,
                                                     )
                             
                         x_samples = model.decode_first_stage(samples)

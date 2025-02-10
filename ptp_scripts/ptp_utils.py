@@ -24,6 +24,70 @@ from torch import nn, einsum
 from einops import rearrange, repeat
 from inspect import isfunction
 
+"""
+# 新增函数：用于向注意力层注册边缘约束钩子
+def register_edge_hooks(model, edge_mask, structure_weight=3.0):
+    hooks = []
+    
+    input: 包含 query, key, value 的元组
+    output: 注意力权重张量（shape: [batch, head, query_pos, key_pos]）
+ 
+    def attention_hook(module, input, output):
+        if edge_mask is not None:
+            # 获取注意力权重的形状 [batch, heads, query_dim, key_dim]
+            batch, heads, query_dim, key_dim = output.shape
+            
+            # 假设 query_dim = h * w，且特征图是正方形
+            h = int(query_dim**0.5)
+            w = h
+            
+            # 动态插值对齐到当前层特征图的分辨率
+            mask = torch.nn.functional.interpolate(
+                edge_mask,
+                size=(h, w),
+                mode='bilinear'
+            ).squeeze(1)  # [batch, h, w]
+            
+            # 将掩码转换为注意力权重形状 [batch, heads, query_pos, key_pos]
+            mask = mask.view(1, 1, h*w, 1)  # 扩展维度以匹配注意力权重
+            # 第二步：将批量维度从 1 扩展到指定的 batch 大小
+            mask = mask.repeat(batch, 1, 1, 1)
+            output = output * (1 + structure_weight * mask)
+            
+        return output
+    
+    def attention_hook(module, input, output):
+        if edge_mask is not None:
+            # 获取注意力权重形状 [batch, heads, query_dim, key_dim]
+            batch, heads, query_dim, key_dim = output.shape
+            
+            # 计算特征图分辨率
+            h = int(query_dim**0.5)
+            w = h
+            
+            # 动态插值对齐
+            mask = torch.nn.functional.interpolate(
+                edge_mask,
+                size=(h, w),
+                mode='bilinear'
+            ).squeeze(1)  # [batch, h, w]
+            
+            # 转换为注意力权重形状 [batch, heads, query_dim, 1]
+            mask = mask.view(batch, 1, h * w, 1).expand(-1, heads, -1, -1)
+            
+            # 增强注意力权重
+            output = output * (1 + structure_weight * mask)
+                
+        return output
+    
+    # 注册钩子到所有交叉注意力层
+    for name, layer in model.named_modules():
+        if "attn2" in name and "transformer_blocks" in name:
+            hook = layer.register_forward_hook(attention_hook)
+            hooks.append(hook)
+    
+    return hooks
+"""
 
 def exists(val):
     return val is not None
@@ -186,7 +250,252 @@ def text2image_ldm_stable(
     return image, latent
 
 
-def register_attention_control(model, controller, center_row_rm, center_col_rm, target_height, target_width, width, height, top=None, left=None, bottom=None, right=None, inject_bg=False, segmentation_map=None, pseudo_cross=False): 
+def register_ref_attention_control(model,controller, center_row_rm, center_col_rm, target_height, target_width, width, height, top=None, left=None, bottom=None, right=None, inject_bg=False, segmentation_map=None, pseudo_cross=False,edge_mask=None):
+    def ca_forward(self, place_in_unet,edge_mask=edge_mask):
+        def forward(x, context=None, mask=None, encode=False, controller_for_inject=None, inject=False, layernum=None, main_height=None, main_width=None,edge_mask=edge_mask):
+            torch.cuda.empty_cache()
+            is_cross = context is not None
+            h = self.heads
+
+            q = self.to_q(x)
+            context = default(context, x)
+            k = self.to_k(context)
+            v = self.to_v(context)  # 保留原始值向量
+
+            q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+            
+            
+            sim = einsum('b i d, b j d -> b i j', q, k) * self.scale  
+
+            if exists(mask):
+                mask = rearrange(mask, 'b ... -> b (...)')
+                max_neg_value = -torch.finfo(sim.dtype).max
+                mask = repeat(mask, 'b j -> (b h) () j', h=h)
+                sim.masked_fill_(~mask, max_neg_value)
+
+            # 新增边缘注意力引导层
+            feat_height = int(sim.shape[1] ** 0.5)
+            feat_weight = feat_height
+            assert feat_height * feat_weight == sim.shape[1], f"sim.shape[1] 必须是 H*W，但得到 {sim.shape[1]}"
+            # 计算下采样比例
+            downsample_ratio = edge_mask.shape[0] // feat_height
+
+            # 根据下采样比例调整 edge_mask
+            edge_mask = edge_mask[::downsample_ratio, ::downsample_ratio]
+
+
+            edge_indices = torch.where(edge_mask.flatten())[0]
+
+            if len(edge_indices) > 0:
+                # 确保索引不越界
+                assert edge_indices.max() < sim.shape[2], f"索引越界！{edge_indices.max()} >= {sim.shape[2]}"
+                #print("在边缘区域加强注意力")
+                sim[:, :, edge_indices] *= 3.0
+            
+            # (保持原有区域计算逻辑不变) 
+            # ref's location in ref image
+            top_rr = int((0.5*(target_height - height))/target_height * main_height)  
+            bottom_rr = int((0.5*(target_height + height))/target_height * main_height) 
+            left_rr = int((0.5*(target_width - width))/target_width * main_width)  
+            right_rr = int((0.5*(target_width + width))/target_width * main_width)  
+            
+            new_height = bottom_rr - top_rr
+            new_width = right_rr - left_rr    
+                
+            step_height2, remainder = divmod(new_height, 2)
+            step_height1 = step_height2 + remainder
+            step_width2, remainder = divmod(new_width, 2)
+            step_width1 = step_width2 + remainder      
+
+            center_row = int(center_row_rm * main_height)
+            center_col = int(center_col_rm * main_width)
+            
+            if pseudo_cross:
+                               
+                ref_init = rearrange(x[2], '(h w) c ->1 c h w', h=main_height).contiguous()
+                context = ref_init[:, :, top_rr:bottom_rr, left_rr:right_rr]
+                
+                context = rearrange(context, '1 c h w ->1 (h w) c').contiguous()
+                context = repeat(context, '1 ... -> b ...', b=2)
+                
+                if (sim.shape[1])**0.5 == 32:
+                    seg_map = segmentation_map[::2, ::2].clone()
+                elif (sim.shape[1])**0.5 == 16:
+                    seg_map = segmentation_map[::4, ::4].clone()
+                elif (sim.shape[1])**0.5 == 8:
+                    seg_map = segmentation_map[::8, ::8].clone()
+                else:
+                    seg_map = segmentation_map.clone()
+                    
+                # record reference location
+                ref_loc_masked = []
+                for i in range(bottom_rr - top_rr):
+                    for j in range(right_rr - left_rr):
+                        if seg_map[top_rr:bottom_rr, left_rr:right_rr][i, j] == 1:
+                            ref_loc_masked.append(int(i * (right_rr - left_rr) + j))        
+                ref_loc_masked = torch.tensor((ref_loc_masked), device=x.device)
+
+                if len(ref_loc_masked) == 0:
+                    masked_context = context
+                else:
+                    masked_context = context[:, ref_loc_masked, :]
+                             
+                k = self.to_k(masked_context)
+                v = self.to_v(masked_context)
+
+                k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (k, v))
+                sim = einsum('b i d, b j d -> b i j', q[int(q.shape[0]/2):], k) * self.scale
+                
+                if exists(mask):
+                    mask = rearrange(mask, 'b ... -> b (...)')
+                    max_neg_value = -torch.finfo(sim.dtype).max
+                    mask = repeat(mask, 'b j -> (b h) () j', h=h)
+                    sim.masked_fill_(~mask, max_neg_value)
+                
+                if encode == False:
+                    sim = controller(sim, is_cross, place_in_unet)
+
+                sim = sim.softmax(dim=-1)
+                out = einsum('b i j, b j d -> b i d', sim, v)
+                out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+                
+                out = torch.cat([out]*2, dim=0)
+                
+                del sim, k, v, masked_context, q, ref_loc_masked, context, ref_init, seg_map, mask
+                
+                return self.to_out(out)
+            
+            if encode == False:
+                sim = controller(sim, is_cross, place_in_unet)
+                
+            if inject or inject_bg and is_cross == False:
+                
+                if (sim.shape[1])**0.5 == 32:
+                    seg_map = segmentation_map[::2, ::2]
+                elif (sim.shape[1])**0.5 == 16:
+                    seg_map = segmentation_map[::4, ::4]
+                elif (sim.shape[1])**0.5 == 8:
+                    seg_map = segmentation_map[::8, ::8]
+                else:
+                    seg_map = segmentation_map
+
+                ref_loc = []
+                ref_loc_masked = []
+                for i in range(top_rr, bottom_rr):
+                    for j in range(left_rr, right_rr):
+                        ref_loc.append(int(i * (sim.shape[1])**0.5 + j))
+                        if seg_map[i, j] == 1:
+                            ref_loc_masked.append(int(i * (sim.shape[1])**0.5 + j))
+                ref_loc_masked = torch.tensor((ref_loc_masked), device=x.device)
+                
+                ref_col_maksed1 = ref_loc_masked.repeat(len(ref_loc_masked)).unsqueeze(1)
+                ref_col_maksed2 = ref_loc_masked.repeat_interleave(len(ref_loc_masked)).unsqueeze(1)
+                
+                # original location
+                orig_loc_masked = []
+                orig_loc = []
+                
+                orig_mask = torch.zeros_like(sim[h:])
+                mask_for_realSA = torch.zeros_like(sim[h:])
+
+                for i_seg, i in enumerate(range(center_row - step_height1, center_row + step_height2)):
+                    for j_seg, j in enumerate(range(center_col - step_width1, center_col + step_width2)):
+                        orig_loc.append(int(i * (sim.shape[1])**0.5 + j))
+                        # within segmentation map
+                        if seg_map[top_rr:bottom_rr, left_rr:right_rr][i_seg, j_seg] == 1:
+                            orig_loc_masked.append(int(i * (sim.shape[1])**0.5 + j))
+                orig_loc_masked = torch.tensor((orig_loc_masked), device=x.device)
+                
+                orig_col_masked1 = orig_loc_masked.repeat(len(orig_loc_masked)).unsqueeze(1)
+                orig_col_masked2 = orig_loc_masked.repeat_interleave(len(orig_loc_masked)).unsqueeze(1)
+
+                orig_loc = torch.tensor((orig_loc), device=x.device)
+                                
+                mask_for_realSA[:, orig_loc, :] = 1
+                mask_for_realSA[:, :, orig_loc] = 1
+                
+                if place_in_unet == 'down':
+                    
+                    if inject_bg:
+                        # inject background of the squared region
+                        sim[h:] = controller_for_inject[0].attention_store['down_self'][layernum] * (1 - mask_for_realSA) + sim[h:] * mask_for_realSA
+
+                    if inject and len(ref_col_maksed1) != 0:
+                        # inject the pesudo cross attention
+                        if len(orig_loc_masked) != 0:
+                            sim[h:, :, orig_loc_masked] = controller_for_inject[2].attention_store['down_self'][layernum] # row injection
+                            sim[h:, orig_loc_masked, :] = controller_for_inject[2].attention_store['down_self'][layernum].permute(0,2,1) # column injection
+                        # inject the foreground in the squared region but masked by the segmentation map
+                        sim[h:, orig_col_masked1, orig_col_masked2] = controller_for_inject[1].attention_store['down_self'][layernum][:, ref_col_maksed1, ref_col_maksed2] 
+                    
+                elif place_in_unet == 'up':  
+                                        
+                    if inject_bg:
+                        # inject background of the squared region
+                        sim[h:] = controller_for_inject[0].attention_store['up_self'][layernum] * (1 - mask_for_realSA) + sim[h:] * mask_for_realSA
+
+                    if inject and len(ref_col_maksed1) != 0:
+                        # inject the pesudo cross attention
+                        if len(orig_loc_masked) != 0:
+                            sim[h:, :, orig_loc_masked] = controller_for_inject[2].attention_store['up_self'][layernum] # row injection
+                            sim[h:, orig_loc_masked, :] = controller_for_inject[2].attention_store['up_self'][layernum].permute(0,2,1) # column injection
+                        # inject the foreground in the squared region but masked by the segmentation map
+                        sim[h:, orig_col_masked1, orig_col_masked2] =  controller_for_inject[1].attention_store['up_self'][layernum][:, ref_col_maksed1, ref_col_maksed2] 
+                    
+                elif place_in_unet == 'mid':
+                    
+                    if inject_bg:
+                        # inject background of the squared region
+                        sim[h:] = controller_for_inject[0].attention_store['mid_self'][layernum] * (1 - mask_for_realSA) + sim[h:] * mask_for_realSA
+        
+                    if inject and len(ref_col_maksed1) != 0:   
+                        # inject the pesudo cross attention
+                        if len(orig_loc_masked) != 0:
+                            sim[h:, :, orig_loc_masked] = controller_for_inject[2].attention_store['mid_self'][layernum] # row injection
+                            sim[h:, orig_loc_masked, :] = controller_for_inject[2].attention_store['mid_self'][layernum].permute(0,2,1) # column injection
+                        # inject the foreground in the squared region but masked by the segmentation map
+                        sim[h:, orig_col_masked1, orig_col_masked2] = controller_for_inject[1].attention_store['mid_self'][layernum][:, ref_col_maksed1, ref_col_maksed2]
+
+                del orig_mask, mask_for_realSA, orig_loc_masked, orig_col_masked1, orig_col_masked2, ref_col_maksed1, ref_col_maksed2
+
+            sim = sim.softmax(dim=-1)
+                
+            out = einsum('b i j, b j d -> b i d', sim, v)
+            out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+            
+            del sim, v, q, k, context
+            
+            return self.to_out(out)
+            
+        return forward
+        
+    def register_recr(net_, count, place_in_unet):
+        if 'CrossAttention' in net_.__class__.__name__:
+            if net_.to_k.in_features != 1024:
+                net_.forward = ca_forward(net_, place_in_unet)
+                return count + 1 
+            else:
+                return count
+        elif hasattr(net_, 'children'):
+            for net__ in net_.children():
+                count = register_recr(net__, count, place_in_unet)
+        return count
+
+    cross_att_count = 0
+    # sub_nets = model.unet.named_children()
+    sub_nets = model.model.diffusion_model.named_children()
+    for net in sub_nets:
+        if "input" in net[0]:
+            cross_att_count += register_recr(net[1], 0, "down")
+        elif "output" in net[0]:
+            cross_att_count += register_recr(net[1], 0, "up")
+        elif "middle" in net[0]:
+            cross_att_count += register_recr(net[1], 0, "mid")
+    controller.num_att_layers = cross_att_count
+
+"""
+def register_ref_attention_control(model, controller, center_row_rm, center_col_rm, target_height, target_width, width, height, top=None, left=None, bottom=None, right=None, inject_bg=False, segmentation_map=None, pseudo_cross=False): 
+    print("register_ref_attention_control function is called!!!!")
     def ca_forward(self, place_in_unet):
         def forward(x, context=None, mask=None, encode=False, controller_for_inject=None, inject=False, layernum=None, main_height=None, main_width=None):
             torch.cuda.empty_cache()
@@ -225,7 +534,229 @@ def register_attention_control(model, controller, center_row_rm, center_col_rm, 
             center_col = int(center_col_rm * main_width)
             
             if pseudo_cross:
-                               
+                print(f"438行：x的形状: {x.shape}")         
+                ref_init = rearrange(x[2], '(h w) c ->1 c h w', h=main_height).contiguous()
+                context = ref_init[:, :, top_rr:bottom_rr, left_rr:right_rr]
+                
+                context = rearrange(context, '1 c h w ->1 (h w) c').contiguous()
+                context = repeat(context, '1 ... -> b ...', b=2)
+                
+                if (sim.shape[1])**0.5 == 32:
+                    seg_map = segmentation_map[::2, ::2].clone()
+                elif (sim.shape[1])**0.5 == 16:
+                    seg_map = segmentation_map[::4, ::4].clone()
+                elif (sim.shape[1])**0.5 == 8:
+                    seg_map = segmentation_map[::8, ::8].clone()
+                else:
+                    seg_map = segmentation_map.clone()
+                    
+                # record reference location
+                ref_loc_masked = []
+                for i in range(bottom_rr - top_rr):
+                    for j in range(right_rr - left_rr):
+                        if seg_map[top_rr:bottom_rr, left_rr:right_rr][i, j] == 1:
+                            ref_loc_masked.append(int(i * (right_rr - left_rr) + j))        
+                ref_loc_masked = torch.tensor((ref_loc_masked), device=x.device)
+
+                if len(ref_loc_masked) == 0:
+                    masked_context = context
+                else:
+                    masked_context = context[:, ref_loc_masked, :]
+                             
+                k = self.to_k(masked_context)
+                v = self.to_v(masked_context)
+
+                k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (k, v))
+                sim = einsum('b i d, b j d -> b i j', q[int(q.shape[0]/2):], k) * self.scale
+                
+                if exists(mask):
+                    mask = rearrange(mask, 'b ... -> b (...)')
+                    max_neg_value = -torch.finfo(sim.dtype).max
+                    mask = repeat(mask, 'b j -> (b h) () j', h=h)
+                    sim.masked_fill_(~mask, max_neg_value)
+                
+                if encode == False:
+                    sim = controller(sim, is_cross, place_in_unet)
+
+                sim = sim.softmax(dim=-1)
+                out = einsum('b i j, b j d -> b i d', sim, v)
+                out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+                
+                out = torch.cat([out]*2, dim=0)
+                
+                del sim, k, v, masked_context, q, ref_loc_masked, context, ref_init, seg_map, mask
+                
+                return self.to_out(out)
+            
+            if encode == False:
+                sim = controller(sim, is_cross, place_in_unet)
+                
+            if inject or inject_bg and is_cross == False:
+                            
+                if (sim.shape[1])**0.5 == 32:
+                    seg_map = segmentation_map[::2, ::2]
+                elif (sim.shape[1])**0.5 == 16:
+                    seg_map = segmentation_map[::4, ::4]
+                elif (sim.shape[1])**0.5 == 8:
+                    seg_map = segmentation_map[::8, ::8]
+                else:
+                    seg_map = segmentation_map
+
+                ref_loc = []
+                ref_loc_masked = []
+                for i in range(top_rr, bottom_rr):
+                    for j in range(left_rr, right_rr):
+                        ref_loc.append(int(i * (sim.shape[1])**0.5 + j))
+                        if seg_map[i, j] == 1:
+                            ref_loc_masked.append(int(i * (sim.shape[1])**0.5 + j))
+                ref_loc_masked = torch.tensor((ref_loc_masked), device=x.device)
+                
+                ref_col_maksed1 = ref_loc_masked.repeat(len(ref_loc_masked)).unsqueeze(1)
+                ref_col_maksed2 = ref_loc_masked.repeat_interleave(len(ref_loc_masked)).unsqueeze(1)
+                
+                # original location
+                orig_loc_masked = []
+                orig_loc = []
+                
+                orig_mask = torch.zeros_like(sim[h:])
+                mask_for_realSA = torch.zeros_like(sim[h:])
+
+                for i_seg, i in enumerate(range(center_row - step_height1, center_row + step_height2)):
+                    for j_seg, j in enumerate(range(center_col - step_width1, center_col + step_width2)):
+                        orig_loc.append(int(i * (sim.shape[1])**0.5 + j))
+                        # within segmentation map
+                        if seg_map[top_rr:bottom_rr, left_rr:right_rr][i_seg, j_seg] == 1:
+                            orig_loc_masked.append(int(i * (sim.shape[1])**0.5 + j))
+                orig_loc_masked = torch.tensor((orig_loc_masked), device=x.device)
+                
+                orig_col_masked1 = orig_loc_masked.repeat(len(orig_loc_masked)).unsqueeze(1)
+                orig_col_masked2 = orig_loc_masked.repeat_interleave(len(orig_loc_masked)).unsqueeze(1)
+
+                orig_loc = torch.tensor((orig_loc), device=x.device)
+                                
+                mask_for_realSA[:, orig_loc, :] = 1
+                mask_for_realSA[:, :, orig_loc] = 1
+                
+                if place_in_unet == 'down':
+                    
+                    if inject_bg:
+                        # inject background of the squared region
+                        sim[h:] = controller_for_inject[0].attention_store['down_self'][layernum] * (1 - mask_for_realSA) + sim[h:] * mask_for_realSA
+
+                    if inject and len(ref_col_maksed1) != 0:
+                        # inject the pesudo cross attention
+                        if len(orig_loc_masked) != 0:
+                            sim[h:, :, orig_loc_masked] = controller_for_inject[2].attention_store['down_self'][layernum] # row injection
+                            sim[h:, orig_loc_masked, :] = controller_for_inject[2].attention_store['down_self'][layernum].permute(0,2,1) # column injection
+                        # inject the foreground in the squared region but masked by the segmentation map
+                        sim[h:, orig_col_masked1, orig_col_masked2] = controller_for_inject[1].attention_store['down_self'][layernum][:, ref_col_maksed1, ref_col_maksed2] 
+                    
+                elif place_in_unet == 'up':  
+                                        
+                    if inject_bg:
+                        # inject background of the squared region
+                        sim[h:] = controller_for_inject[0].attention_store['up_self'][layernum] * (1 - mask_for_realSA) + sim[h:] * mask_for_realSA
+
+                    if inject and len(ref_col_maksed1) != 0:
+                        # inject the pesudo cross attention
+                        if len(orig_loc_masked) != 0:
+                            sim[h:, :, orig_loc_masked] = controller_for_inject[2].attention_store['up_self'][layernum] # row injection
+                            sim[h:, orig_loc_masked, :] = controller_for_inject[2].attention_store['up_self'][layernum].permute(0,2,1) # column injection
+                        # inject the foreground in the squared region but masked by the segmentation map
+                        sim[h:, orig_col_masked1, orig_col_masked2] =  controller_for_inject[1].attention_store['up_self'][layernum][:, ref_col_maksed1, ref_col_maksed2] 
+                    
+                elif place_in_unet == 'mid':
+                    
+                    if inject_bg:
+                        # inject background of the squared region
+                        sim[h:] = controller_for_inject[0].attention_store['mid_self'][layernum] * (1 - mask_for_realSA) + sim[h:] * mask_for_realSA
+        
+                    if inject and len(ref_col_maksed1) != 0:   
+                        # inject the pesudo cross attention
+                        if len(orig_loc_masked) != 0:
+                            sim[h:, :, orig_loc_masked] = controller_for_inject[2].attention_store['mid_self'][layernum] # row injection
+                            sim[h:, orig_loc_masked, :] = controller_for_inject[2].attention_store['mid_self'][layernum].permute(0,2,1) # column injection
+                        # inject the foreground in the squared region but masked by the segmentation map
+                        sim[h:, orig_col_masked1, orig_col_masked2] = controller_for_inject[1].attention_store['mid_self'][layernum][:, ref_col_maksed1, ref_col_maksed2]
+
+                del orig_mask, mask_for_realSA, orig_loc_masked, orig_col_masked1, orig_col_masked2, ref_col_maksed1, ref_col_maksed2
+
+            sim = sim.softmax(dim=-1)
+                
+            out = einsum('b i j, b j d -> b i d', sim, v)
+            out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+            
+            del sim, v, q, k, context
+            
+            return self.to_out(out)
+            
+        return forward
+    
+    def register_recr(net_, count, place_in_unet):
+        if 'CrossAttention' in net_.__class__.__name__:
+            if net_.to_k.in_features != 1024:
+                net_.forward = ca_forward(net_, place_in_unet)
+                return count + 1 
+            else:
+                return count
+        elif hasattr(net_, 'children'):
+            for net__ in net_.children():
+                count = register_recr(net__, count, place_in_unet)
+        return count
+
+    cross_att_count = 0
+    # sub_nets = model.unet.named_children()
+    sub_nets = model.model.diffusion_model.named_children()
+    for net in sub_nets:
+        if "input" in net[0]:
+            cross_att_count += register_recr(net[1], 0, "down")
+        elif "output" in net[0]:
+            cross_att_count += register_recr(net[1], 0, "up")
+        elif "middle" in net[0]:
+            cross_att_count += register_recr(net[1], 0, "mid")
+    controller.num_att_layers = cross_att_count
+
+"""
+
+def register_attention_control(model, controller, center_row_rm, center_col_rm, target_height, target_width, width, height, top=None, left=None, bottom=None, right=None, inject_bg=False, segmentation_map=None, pseudo_cross=False): 
+    def ca_forward(self, place_in_unet):
+        def forward(x, context=None, mask=None, encode=False, controller_for_inject=None, inject=False, layernum=None, main_height=None, main_width=None):
+            torch.cuda.empty_cache()
+            is_cross = context is not None
+            h = self.heads
+
+            q = self.to_q(x)
+            context = default(context, x)
+            k = self.to_k(context)
+            v = self.to_v(context)
+
+            q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+            sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+                        
+            if exists(mask):
+                mask = rearrange(mask, 'b ... -> b (...)')
+                max_neg_value = -torch.finfo(sim.dtype).max
+                mask = repeat(mask, 'b j -> (b h) () j', h=h)
+                sim.masked_fill_(~mask, max_neg_value)
+                    
+            # ref's location in ref image
+            top_rr = int((0.5*(target_height - height))/target_height * main_height)  
+            bottom_rr = int((0.5*(target_height + height))/target_height * main_height) 
+            left_rr = int((0.5*(target_width - width))/target_width * main_width)  
+            right_rr = int((0.5*(target_width + width))/target_width * main_width)  
+            
+            new_height = bottom_rr - top_rr
+            new_width = right_rr - left_rr    
+                
+            step_height2, remainder = divmod(new_height, 2)
+            step_height1 = step_height2 + remainder
+            step_width2, remainder = divmod(new_width, 2)
+            step_width1 = step_width2 + remainder      
+
+            center_row = int(center_row_rm * main_height)
+            center_col = int(center_col_rm * main_width)
+            
+            if pseudo_cross:     
                 ref_init = rearrange(x[2], '(h w) c ->1 c h w', h=main_height).contiguous()
                 context = ref_init[:, :, top_rr:bottom_rr, left_rr:right_rr]
                 
